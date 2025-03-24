@@ -113,7 +113,6 @@ public class TransactionManagerImpl implements TransactionManager {
     private void incrXIDCounter() {
         xidCounter++;
         // 将xidCounter整合为byte类型存入buffer
-        //
         ByteBuffer buffer = ByteBuffer.wrap(Parser.long2Byte(xidCounter));
         try {
             // 从开头开始更新XID Header
@@ -142,7 +141,6 @@ public class TransactionManagerImpl implements TransactionManager {
     // 检查XID事务是否处于status状态
     private boolean checkXID(long xid, byte status) {
         long offset = getXidPosition(xid);
-        //
         ByteBuffer buffer = ByteBuffer.wrap(new byte[XID_FIELD_SIZE]);
         try {
             fileChannel.position(offset);
