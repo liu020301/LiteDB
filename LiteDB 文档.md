@@ -503,3 +503,130 @@ protected void release(long key){
 
 
 
+### 页面缓存
+
+> 前言（原文）
+>
+> 本节主要内容就是 DM 模块向下对文件系统的抽象部分。DM 将文件系统抽象成页面，每次对文件系统的读写都是以页面为单位的。同样，从文件系统读进来的数据也是以页面为单位进行缓存的。
+
+默认将数据页大小定为8K。上面已经实现了一个通用的缓存框架，这里就可以直接借用哪个缓存框架。
+
+#### 定义页面结构
+
+页面是存储在内存的数据单元。
+
+* pageNumber：页面的页号，从1开始。
+* data：实际包含的字节数据。
+* dirty：标志着页面是否是脏页面，缓存驱逐时要将脏页面写回磁盘。脏页面指修改了但还没写入磁盘的页面。
+* lock：用于页面的锁
+* pc：一个PageCache的引用，用来方便在拿到Page的引用时可以快速对这个页面的缓存进行释放操作。
+
+```java
+public class PageImpl implements Page {
+    private int pageNumber;
+    private byte[] data;
+    private boolean dirty;
+    private Lock lock;
+    private PageCache pc;
+}
+```
+
+#### 定义页面缓存的接口
+
+```java
+public interface PageCache {
+    int newPage(byte[] initData);
+    Page getpage(int pgno) throws Exception;
+    void close();
+    void release(Page page);
+
+    void truncateByBgno(int maxPgno);
+    int getPageNumber();
+    void flushPage(Page page);
+
+}
+```
+
+页面缓存的具体实现类要继承抽象缓存框架，并且实现getForCache() 和 releaseForCache() 两个抽象方法。由于数据源就是文件系统，getForCache()直接从文件中读取并包裹成Page：
+
+```java 
+/**
+ * 当缓存未命中时，根据pageNumber从数据库文件中读取页数据，并包裹成Page。
+ */
+@Override
+protected Page getForCache(long key) throws Exception {
+    int pgno = (int)key;
+    long offset = PageCacheImpl.pageOffset(pgno);
+    ByteBuffer buffer = ByteBuffer.allocate(PAGE_SIZE);
+    fileLock.lock();
+    try {
+        fc.position(offset);
+        fc.read(buffer); // 读取 PAGE_SIZE 字节
+    } catch (IOException e) {
+        Panic.panic(e);
+    }
+    fileLock.unlock();
+    return new PageImpl(pgno, buffer.array(), this); // 封装为 Page 对象并绑定缓存引用
+}
+```
+
+releaseForCache驱逐页面时，只需要根据页面是否是脏页面，来决定是否需要写回文件系统。是脏页面就写回，不是脏页面的话，意味着文件没有修改，就不用写回了。
+
+```java
+    /**
+     * 当页从缓存中被释放时，如果是脏页则写回磁盘
+     */
+    @Override
+    protected void releaseForCache(Page page) {
+        if (page.isDirty()) {
+            flush(page);
+            page.setDirty(false);
+        }
+    }
+
+    /**
+     * 释放页缓存（将引用计数 -1）
+     */
+    public void release(Page page) {
+        release((long)page.getPageNumber());
+    }
+
+    /**
+     * 强制将页写回磁盘，无论是否为脏页
+     */
+    public void flushPage(Page page) {
+        flush(page);
+    }
+
+    /**
+     * 将页内容写入磁盘
+     */
+    private void flush(Page page) {
+        int pgno = page.getPageNumber();
+        long offset = PageCacheImpl.pageOffset(pgno);
+
+        fileLock.lock();
+        try {
+            ByteBuffer buffer = ByteBuffer.wrap(page.getData());
+            fc.position(offset);
+            fc.write(buffer);
+            fc.force(false);
+        } catch (IOException e) {
+            Panic.panic(e);
+        } finally {
+            fileLock.unlock();
+        }
+    }
+```
+
+PageCache使用了一个AtomicInteger，记录了当前打开的数据库文件有多少页，在数据库文件打开时就会被计算，并在新建页面时自增。
+
+```java
+public int newPage(byte[] initData) {
+    int pgno = pageNumbers.incrementAndGet();
+    Page pg = new PageImpl(pgno, initData, null);
+    flush(pg);  // 新建的页面要立刻写回
+    return pgno;
+}
+```
+
